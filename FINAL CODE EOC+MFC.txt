@@ -2,22 +2,23 @@ import cv2
 import os
 import numpy as np
 import torch
+import yaml
 from ultralytics import YOLO
 from typing import List, Dict
 from scipy.spatial.distance import cdist
-import yaml
 
 class CombatZoneObjectTracker:
-    def _init_(self, model_path: str = 'best.pt', train_data: str = '/kaggle/input/plzzz-bro/data.yaml', epochs: int = 10):
-        # Load class names from data.yaml
-        self.class_names = self._load_class_names(train_data)
-        print(f"Loaded {len(self.class_names)} class names: {self.class_names}")
-        
+    def __init__(self, model_path: str = 'best.pt', train_data: str = '/kaggle/input/plzzz-bro/data.yaml', epochs: int = 10):
         if not os.path.exists(model_path):
             print("Trained model not found. Starting training...")
             self._train_model(train_data, epochs)
         else:
             print(f"Loading trained model: {model_path}")
+        
+        # Initialize class names from data.yaml
+        self.class_names = self._load_class_names(train_data)
+        print(f"Loaded {len(self.class_names)} class names from dataset")
+        
         self.detection_model = YOLO(model_path)
         print("YOLO model loaded successfully")
         
@@ -39,30 +40,27 @@ class CombatZoneObjectTracker:
         self.history_length = 20  # Number of frames to keep in history
         self.min_hits = 3  # Minimum detections before considering a track confirmed
 
-    def _load_class_names(self, data_yaml_path: str) -> List[str]:
-        """Load class names from YAML file"""
+    def _load_class_names(self, data_yaml_path: str) -> dict:
+        """Load class names from YOLO data.yaml file"""
         try:
-            with open(data_yaml_path, 'r') as file:
-                data = yaml.safe_load(file)
-                class_names = data.get('names', {})
+            with open(data_yaml_path, 'r') as f:
+                data = yaml.safe_load(f)
                 
-                # Handle both list and dict formats
-                if isinstance(class_names, list):
-                    return class_names
-                elif isinstance(class_names, dict):
-                    # Sort by class index if it's a dictionary
-                    max_idx = max(int(k) for k in class_names.keys() if k.isdigit())
-                    sorted_names = ["Unknown"] * (max_idx + 1)
-                    for k, v in class_names.items():
-                        if k.isdigit():
-                            sorted_names[int(k)] = v
-                    return sorted_names
-                else:
-                    print("Warning: Unexpected class names format in data.yaml. Using default names.")
-                    return [f"Class_{i}" for i in range(100)]
+            # YOLO data.yaml can have class names in different formats
+            if 'names' in data:
+                if isinstance(data['names'], dict):
+                    return data['names']  # Already a dictionary
+                elif isinstance(data['names'], list):
+                    # Convert list to dictionary
+                    return {i: name for i, name in enumerate(data['names'])}
+            
+            print("Warning: Could not find class names in data.yaml. Using generic class IDs.")
+            return {}  # Return empty dict if no class names found
+            
         except Exception as e:
-            print(f"Error reading data.yaml: {e}. Using default names.")
-            return [f"Class_{i}" for i in range(100)]
+            print(f"Error loading class names from {data_yaml_path}: {e}")
+            # Fallback to generic class IDs
+            return {}
 
     def _train_model(self, data_path: str, epochs: int):
         model = YOLO("yolov8m.pt")  # Start with YOLOv8 Medium
@@ -147,6 +145,10 @@ class CombatZoneObjectTracker:
         # Calculate IoU
         return intersection_area / union_area if union_area > 0 else 0.0
     
+    def get_class_name(self, class_id):
+        """Convert numeric class ID to human-readable name"""
+        return self.class_names.get(class_id, f"Class {class_id}")
+    
     def detect_objects(self, frame: np.ndarray) -> List[Dict]:
         results = self.detection_model(frame, conf=0.4)  # Slightly higher confidence threshold
         detected_objects = []
@@ -156,9 +158,6 @@ class CombatZoneObjectTracker:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 confidence = float(box.conf[0])
                 class_id = int(box.cls[0])
-                
-                # Get class name
-                class_name = self._get_class_name(class_id)
                 
                 # Skip small detections as they're often false positives
                 w, h = x2 - x1, y2 - y1
@@ -174,17 +173,10 @@ class CombatZoneObjectTracker:
                     'height': h,
                     'confidence': confidence,
                     'center': (center_x, center_y),
-                    'class_id': class_id,
-                    'class_name': class_name
+                    'class_id': class_id
                 })
         
         return detected_objects
-    
-    def _get_class_name(self, class_id):
-        """Get class name from class ID with safety check"""
-        if 0 <= class_id < len(self.class_names):
-            return self.class_names[class_id]
-        return f"Class_{class_id}"
     
     def _get_dominant_class(self, tracker_id):
         """Return the most common class ID for this tracker"""
@@ -203,6 +195,7 @@ class CombatZoneObjectTracker:
     
     def track_objects(self, detected_objects: List[Dict]) -> List[Dict]:
         tracked_objects = []
+        predicted_positions = {}  # Store predicted future positions
         
         # Mark all existing trackers as disappeared for this frame
         for tracker_id in list(self.last_positions.keys()):
@@ -258,8 +251,7 @@ class CombatZoneObjectTracker:
                 tracked_objects.append({
                     **obj,
                     'tracker_id': tracker_id,
-                    'dominant_class': class_id,
-                    'dominant_class_name': self._get_class_name(class_id)
+                    'dominant_class': class_id
                 })
         else:
             # First prediction step for all existing Kalman filters
@@ -275,6 +267,13 @@ class CombatZoneObjectTracker:
                     'width': w,
                     'height': h
                 }
+                
+                # Calculate future position (10 frames ahead)
+                vx, vy = float(prediction[4]), float(prediction[5])  # Velocity components
+                future_x = x + 10 * vx
+                future_y = y + 10 * vy
+                future_bbox = [future_x - w/2, future_y - h/2, future_x + w/2, future_y + h/2]
+                predicted_positions[tracker_id] = future_bbox
             
             # Calculate IoU matrix between predictions and detections
             iou_matrix = np.zeros((len(self.last_positions), len(detected_objects)))
@@ -377,14 +376,18 @@ class CombatZoneObjectTracker:
                 
                 # Add to tracked objects with dominant class
                 dominant_class = self._get_dominant_class(tracker_id)
-                dominant_class_name = self._get_class_name(dominant_class) if dominant_class is not None else "Unknown"
                 
-                tracked_objects.append({
+                # Add predicted future position if available
+                obj_with_tracking = {
                     **obj,
                     'tracker_id': tracker_id,
-                    'dominant_class': dominant_class,
-                    'dominant_class_name': dominant_class_name
-                })
+                    'dominant_class': dominant_class
+                }
+                
+                if tracker_id in predicted_positions:
+                    obj_with_tracking['predicted_bbox'] = predicted_positions[tracker_id]
+                
+                tracked_objects.append(obj_with_tracking)
             
             # Create new trackers for unmatched detections
             for j in range(len(detected_objects)):
@@ -418,8 +421,7 @@ class CombatZoneObjectTracker:
                     tracked_objects.append({
                         **obj,
                         'tracker_id': tracker_id,
-                        'dominant_class': obj['class_id'],
-                        'dominant_class_name': obj['class_name']
+                        'dominant_class': obj['class_id']
                     })
             
             # Remove trackers that have been missing for too long
@@ -468,45 +470,46 @@ def main():
         objects = tracker.detect_objects(frame)
         tracked_objects = tracker.track_objects(objects)
         
-        # Draw tracking lines for each object
+        # Draw tracking information for each object
         for obj in tracked_objects:
             x1, y1, x2, y2 = map(int, obj['bbox'])
             confidence = obj['confidence']
             tracker_id = obj['tracker_id']
-            class_name = obj['dominant_class_name'] if 'dominant_class_name' in obj else obj['class_name']
+            class_id = obj['dominant_class'] if 'dominant_class' in obj else obj['class_id']
             
             # Use consistent colors based on tracker_id
             color = ((tracker_id * 50) % 255, (tracker_id * 80) % 255, (tracker_id * 120) % 255)
             
-            # Draw bounding box
+            # Draw current bounding box with thicker lines
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
             # Draw label with class name
+            class_name = tracker.get_class_name(class_id)
             label = f"ID: {tracker_id} {class_name} {confidence:.2f}"
             
-            # Calculate label background size
-            (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            # Improve text visibility with background
+            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            y_label = max(y1 - 10, label_size[1] + 10)
+            cv2.rectangle(frame, (x1, y_label - label_size[1] - 10), (x1 + label_size[0], y_label + baseline - 10), (154, 148, 152), cv2.FILLED)
+            cv2.putText(frame, label, (x1, y_label - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            # Draw label background
-            cv2.rectangle(frame, 
-                          (x1, y1 - label_height - 10), 
-                          (x1 + label_width + 10, y1), 
-                          color, 
-                          -1)  # Filled rectangle
-            
-            # Draw white text for better visibility
-            cv2.putText(frame, label, (x1 + 5, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            
-            # Draw tracking line using history
-            if tracker_id in tracker.track_history and len(tracker.track_history[tracker_id]) > 1:
-                history = tracker.track_history[tracker_id]
-                for i in range(1, len(history)):
-                    p1 = tuple(map(int, history[i-1]))
-                    p2 = tuple(map(int, history[i]))
-                    thickness = 2
-                    cv2.line(frame, p1, p2, color, thickness)
+            # Draw predicted future position (red box)
+            if 'predicted_bbox' in obj:
+                px1, py1, px2, py2 = map(int, obj['predicted_bbox'])
+                # Ensure the predicted box stays within frame boundaries
+                px1 = max(0, min(px1, width-1))
+                py1 = max(0, min(py1, height-1))
+                px2 = max(0, min(px2, width-1))
+                py2 = max(0, min(py2, height-1))
+                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 2)  # Red box for prediction
+                
+                # Draw an arrow from current position to predicted position
+                current_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                predicted_center = ((px1 + px2) // 2, (py1 + py2) // 2)
+                cv2.arrowedLine(frame, current_center, predicted_center, (0, 0, 255), 2)
         
-        # Add frame counter at the top left
+        # Add frame counter at the top left with better visibility
+        cv2.rectangle(frame, (5, 5), (180, 40), (0, 0, 0), cv2.FILLED)
         cv2.putText(frame, f"Frame: {frame_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Write frame to output video
@@ -516,5 +519,5 @@ def main():
     out.release()
     print(f"Processing complete. Output saved as {output_path}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
